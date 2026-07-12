@@ -36,21 +36,24 @@ fn main() -> Result<()> {
     let files = discover_sql_files(&config.sql_dir)?;
 
     if files.is_empty() {
-        bail!("目录 {} 下没有找到 .sql 文件", config.sql_dir.display());
+        bail!(
+            "No .sql files found in directory {}",
+            config.sql_dir.display()
+        );
     }
 
     println!(
-        "开始导入，共发现 {} 个 SQL 文件，目录：{}",
+        "Starting import. Found {} SQL files in {}",
         files.len(),
         config.sql_dir.display()
     );
-    println!("并发模式：每个 SQL 文件启动一个线程执行导入");
+    println!("Concurrent mode enabled: one thread per SQL import task");
 
     let started_at = Instant::now();
     let (imported_count, skipped_count) = run_import_tasks(&config, files)?;
 
     println!(
-        "全部导入完成，总耗时：{:.2?}，成功 {} 个，跳过 {} 个",
+        "Import completed in {:.2?}. Imported: {}, Skipped: {}",
         started_at.elapsed(),
         imported_count,
         skipped_count
@@ -117,20 +120,23 @@ fn run_import_tasks(config: &AppConfig, files: Vec<PathBuf>) -> Result<(usize, u
             }) => {
                 skipped_count += 1;
                 eprintln!(
-                    "[{database_name}] 提醒：{}，已跳过当前文件 {}",
+                    "[{database_name}] Notice: {}. Skipped file {}",
                     reason,
                     file.display()
                 );
             }
             Ok(ImportTaskResult::Failed { database_name, err }) => {
                 if first_fatal_error.is_none() {
-                    first_fatal_error =
-                        Some(err.context(format!("数据库 {} 导入任务失败", database_name)));
+                    first_fatal_error = Some(
+                        err.context(format!("Import task failed for database {}", database_name)),
+                    );
                 }
             }
             Err(_) => {
                 if first_fatal_error.is_none() {
-                    first_fatal_error = Some(anyhow::anyhow!("存在导入线程异常退出"));
+                    first_fatal_error = Some(anyhow::anyhow!(
+                        "An import worker thread exited unexpectedly"
+                    ));
                 }
             }
         }
@@ -144,22 +150,22 @@ fn run_import_tasks(config: &AppConfig, files: Vec<PathBuf>) -> Result<(usize, u
 }
 
 fn read_required_env(key: &str) -> Result<String> {
-    env::var(key).with_context(|| format!("缺少环境变量: {key}，请检查 .env"))
+    env::var(key).with_context(|| format!("Missing environment variable: {key}. Please check .env"))
 }
 
 fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
-        _ => bail!("环境变量 {key} 的值无效: {value}"),
+        _ => bail!("Invalid value for environment variable {key}: {value}"),
     }
 }
 
 fn discover_sql_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
-    for entry in
-        fs::read_dir(dir).with_context(|| format!("读取 SQL 目录失败: {}", dir.display()))?
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("Failed to read SQL directory: {}", dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -183,29 +189,34 @@ fn database_name_from_file(path: &Path) -> Result<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-        .with_context(|| format!("无法从文件名解析数据库名: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to parse database name from file name: {}",
+                path.display()
+            )
+        })?;
 
     Ok(database_name)
 }
 
 fn import_one_file(config: &AppConfig, file: &Path, database_name: &str) -> Result<()> {
     let content = fs::read_to_string(file)
-        .with_context(|| format!("读取 SQL 文件失败: {}", file.display()))?;
+        .with_context(|| format!("Failed to read SQL file: {}", file.display()))?;
     let statements = split_sql_statements(&content)
-        .with_context(|| format!("解析 SQL 文件失败: {}", file.display()))?;
+        .with_context(|| format!("Failed to parse SQL file: {}", file.display()))?;
 
     println!(
-        "\n[{database_name}] 开始导入，文件：{}，语句数：{}",
+        "\n[{database_name}] Starting import. File: {}, Statements: {}",
         file.display(),
         statements.len()
     );
 
     let mut conn = connect_to_database(config, database_name)
-        .with_context(|| format!("连接数据库失败: {}", database_name))?;
+        .with_context(|| format!("Failed to connect to database: {}", database_name))?;
 
     if config.disable_foreign_key_checks {
         conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")
-            .with_context(|| format!("关闭外键检查失败: {}", database_name))?;
+            .with_context(|| format!("Failed to disable foreign key checks: {}", database_name))?;
     }
 
     reset_database_objects(&mut conn, database_name)?;
@@ -215,7 +226,7 @@ fn import_one_file(config: &AppConfig, file: &Path, database_name: &str) -> Resu
     for (index, statement) in statements.iter().enumerate() {
         conn.query_drop(statement.as_str()).with_context(|| {
             format!(
-                "执行失败，数据库: {}，第 {} 条语句，预览: {}",
+                "Execution failed. Database: {}, Statement #{}, Preview: {}",
                 database_name,
                 index + 1,
                 preview_sql(statement)
@@ -225,11 +236,13 @@ fn import_one_file(config: &AppConfig, file: &Path, database_name: &str) -> Resu
 
     if config.disable_foreign_key_checks {
         conn.query_drop("SET FOREIGN_KEY_CHECKS = 1")
-            .with_context(|| format!("恢复外键检查失败: {}", database_name))?;
+            .with_context(|| {
+                format!("Failed to re-enable foreign key checks: {}", database_name)
+            })?;
     }
 
     println!(
-        "[{database_name}] 导入完成，耗时：{:.2?}",
+        "[{database_name}] Import finished in {:.2?}",
         started_at.elapsed()
     );
     Ok(())
@@ -245,10 +258,10 @@ fn reset_database_objects(conn: &mut PooledConn, database_name: &str) -> Result<
             ORDER BY TABLE_TYPE, TABLE_NAME
             "#,
         )
-        .with_context(|| format!("读取数据库对象列表失败: {}", database_name))?;
+        .with_context(|| format!("Failed to read database objects: {}", database_name))?;
 
     if objects.is_empty() {
-        println!("[{database_name}] 清空阶段：当前数据库没有现存表或视图");
+        println!("[{database_name}] Reset phase: no existing tables or views found");
         return Ok(());
     }
 
@@ -267,14 +280,14 @@ fn reset_database_objects(conn: &mut PooledConn, database_name: &str) -> Result<
 
         conn.query_drop(sql).with_context(|| {
             format!(
-                "清空数据库失败，数据库: {}，对象: {}，类型: {}",
+                "Failed to reset database. Database: {}, Object: {}, Type: {}",
                 database_name, object_name, object_type
             )
         })?;
     }
 
     println!(
-        "[{database_name}] 清空阶段完成，已删除 {} 个表，{} 个视图",
+        "[{database_name}] Reset phase finished. Dropped {} tables and {} views",
         table_count, view_count
     );
     Ok(())
@@ -283,7 +296,7 @@ fn reset_database_objects(conn: &mut PooledConn, database_name: &str) -> Result<
 fn connect_to_database(config: &AppConfig, database_name: &str) -> Result<PooledConn> {
     let dsn = build_database_dsn(&config.mysql_dsn, database_name)?;
     let opts = Opts::from_url(&dsn)
-        .with_context(|| format!("MYSQL_DSN 格式不正确: {}", mask_dsn(&dsn)))?;
+        .with_context(|| format!("Invalid MYSQL_DSN format: {}", mask_dsn(&dsn)))?;
     let pool = Pool::new(opts)?;
     let mut conn = pool.get_conn()?;
     conn.query_drop(format!("SET NAMES {}", config.charset))?;
@@ -292,7 +305,7 @@ fn connect_to_database(config: &AppConfig, database_name: &str) -> Result<Pooled
 
 fn build_database_dsn(base_dsn: &str, database_name: &str) -> Result<String> {
     let mut url = Url::parse(base_dsn)
-        .with_context(|| format!("MYSQL_DSN 不是合法链接: {}", mask_dsn(base_dsn)))?;
+        .with_context(|| format!("MYSQL_DSN is not a valid URL: {}", mask_dsn(base_dsn)))?;
     url.set_path(&format!("/{}", database_name));
     Ok(url.to_string())
 }
@@ -335,9 +348,9 @@ fn mysql_error_code(err: &anyhow::Error) -> Option<u16> {
 
 fn skip_reason_for_mysql_error(code: u16) -> Option<&'static str> {
     match code {
-        1049 => Some("数据库不存在"),
-        1044 | 1045 => Some("没有权限进入数据库"),
-        1142 | 1227 => Some("当前账号没有足够权限执行导入"),
+        1049 => Some("database does not exist"),
+        1044 | 1045 => Some("access denied for this database"),
+        1142 | 1227 => Some("insufficient privileges to run the import"),
         _ => None,
     }
 }
@@ -378,7 +391,7 @@ fn split_sql_statements(input: &str) -> Result<Vec<String>> {
         {
             delimiter = trimmed["DELIMITER ".len()..].trim().to_string();
             if delimiter.is_empty() {
-                bail!("检测到空 DELIMITER");
+                bail!("Encountered an empty DELIMITER declaration");
             }
             continue;
         }
@@ -593,7 +606,10 @@ INSERT INTO t VALUES (1);
             message: "Unknown database 'gtt'".to_string(),
             code: 1049,
         }));
-        assert_eq!(is_skippable_database_error(&err), Some("数据库不存在"));
+        assert_eq!(
+            is_skippable_database_error(&err),
+            Some("database does not exist")
+        );
     }
 
     #[test]
@@ -615,7 +631,7 @@ INSERT INTO t VALUES (1);
         }));
         assert_eq!(
             is_skippable_database_error(&err),
-            Some("没有权限进入数据库")
+            Some("access denied for this database")
         );
     }
 
@@ -628,7 +644,7 @@ INSERT INTO t VALUES (1);
         }));
         assert_eq!(
             is_skippable_database_error(&err),
-            Some("当前账号没有足够权限执行导入")
+            Some("insufficient privileges to run the import")
         );
     }
 
