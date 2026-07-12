@@ -18,6 +18,7 @@ MYSQL_DSN=mysql://your_user:your_password@rm-xxxx.mysql.rds.aliyuncs.com:3306
 SQL_DIR=./sql
 MYSQL_CHARSET=utf8mb4
 DISABLE_FOREIGN_KEY_CHECKS=true
+IGNORE_DATABASES=gtt,order
 ```
 
 Variables:
@@ -26,6 +27,7 @@ Variables:
 - `SQL_DIR`: Directory containing SQL files. Default: `./sql`
 - `MYSQL_CHARSET`: Connection charset. Default: `utf8mb4`
 - `DISABLE_FOREIGN_KEY_CHECKS`: Disables and restores foreign key checks around the import. Default: `true`
+- `IGNORE_DATABASES`: Comma-separated database names to skip entirely. Skipped databases will not be reset or imported.
 
 ## Run
 
@@ -40,5 +42,6 @@ cargo run
 - The file name without the `.sql` suffix is used as the target database name
 - Example: if `.env` contains `MYSQL_DSN=mysql://user:pass@host:3306`, importing `sql/gtt.sql` connects to `mysql://user:pass@host:3306/gtt`
 - Before importing, the tool drops existing tables and views in the target database
+- Databases listed in `IGNORE_DATABASES` are skipped entirely before any reset or import work starts
 - If a target database does not exist, or the current account does not have access to enter or import it, the tool prints a terminal notice and skips that file
 - Common MySQL dump files with `DELIMITER` statements are supported

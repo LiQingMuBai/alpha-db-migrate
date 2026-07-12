@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use dotenvy::dotenv;
 use mysql::{Error as MySqlDriverError, MySqlError, Opts, Pool, PooledConn, prelude::Queryable};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ struct AppConfig {
     sql_dir: PathBuf,
     charset: String,
     disable_foreign_key_checks: bool,
+    ignored_databases: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -74,6 +76,9 @@ impl AppConfig {
                 .map(|value| parse_bool_env("DISABLE_FOREIGN_KEY_CHECKS", &value))
                 .transpose()?
                 .unwrap_or(true),
+            ignored_databases: env::var("IGNORE_DATABASES")
+                .map(|value| parse_database_list(&value))
+                .unwrap_or_default(),
         })
     }
 }
@@ -90,6 +95,15 @@ fn run_import_tasks(config: &AppConfig, files: Vec<PathBuf>) -> Result<(usize, u
     let mut handles = Vec::with_capacity(tasks.len());
 
     for (file, database_name) in tasks {
+        if should_ignore_database(config, &database_name) {
+            handles.push(thread::spawn(move || ImportTaskResult::Skipped {
+                database_name,
+                file,
+                reason: "ignored by configuration",
+            }));
+            continue;
+        }
+
         let config = config.clone();
         handles.push(thread::spawn(move || {
             match import_one_file(&config, &file, &database_name) {
@@ -159,6 +173,25 @@ fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => bail!("Invalid value for environment variable {key}: {value}"),
     }
+}
+
+fn parse_database_list(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(normalize_database_name)
+        .collect()
+}
+
+fn normalize_database_name(database_name: &str) -> String {
+    database_name.trim().to_ascii_lowercase()
+}
+
+fn should_ignore_database(config: &AppConfig, database_name: &str) -> bool {
+    config
+        .ignored_databases
+        .contains(&normalize_database_name(database_name))
 }
 
 fn discover_sql_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -533,10 +566,13 @@ fn split_sql_statements(input: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_database_dsn, escape_identifier, is_skippable_database_error, split_sql_statements,
+        AppConfig, build_database_dsn, escape_identifier, is_skippable_database_error,
+        parse_database_list, should_ignore_database, split_sql_statements,
     };
     use anyhow::anyhow;
     use mysql::{Error as MySqlDriverError, MySqlError};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn splits_basic_statements() {
@@ -651,5 +687,29 @@ INSERT INTO t VALUES (1);
     #[test]
     fn escapes_backticks_in_identifier() {
         assert_eq!(escape_identifier("odd`name"), "odd``name");
+    }
+
+    #[test]
+    fn parses_ignored_database_list() {
+        let ignored = parse_database_list(" gtt, order ,, Test_DB ");
+        assert!(ignored.contains("gtt"));
+        assert!(ignored.contains("order"));
+        assert!(ignored.contains("test_db"));
+        assert_eq!(ignored.len(), 3);
+    }
+
+    #[test]
+    fn matches_ignored_database_case_insensitively() {
+        let config = AppConfig {
+            mysql_dsn: "mysql://user:pass@127.0.0.1:3306".to_string(),
+            sql_dir: PathBuf::from("./sql"),
+            charset: "utf8mb4".to_string(),
+            disable_foreign_key_checks: true,
+            ignored_databases: HashSet::from([String::from("gtt"), String::from("order")]),
+        };
+
+        assert!(should_ignore_database(&config, "GTT"));
+        assert!(should_ignore_database(&config, "order"));
+        assert!(!should_ignore_database(&config, "billing"));
     }
 }
