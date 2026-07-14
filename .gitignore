@@ -1,5 +1,6 @@
 /target
 /export_sql
+.DS_Store
 .env
 .env.*
 !.env.example

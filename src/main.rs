@@ -11,7 +11,7 @@ use url::Url;
 
 #[derive(Clone, Debug)]
 struct AppConfig {
-    mysql_dsn: String,
+    import_mysql_dsn: String,
     sql_dir: PathBuf,
     charset: String,
     disable_foreign_key_checks: bool,
@@ -66,7 +66,11 @@ fn main() -> Result<()> {
 impl AppConfig {
     fn from_env() -> Result<Self> {
         Ok(Self {
-            mysql_dsn: read_required_env("MYSQL_DSN")?,
+            import_mysql_dsn: read_optional_env("IMPORT_MYSQL_DSN")?
+                .or_else(|| read_optional_env("MYSQL_DSN").ok().flatten())
+                .with_context(|| {
+                    "Missing environment variable: IMPORT_MYSQL_DSN (or MYSQL_DSN fallback). Please check .env"
+                })?,
             sql_dir: env::var("SQL_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./sql")),
@@ -163,8 +167,19 @@ fn run_import_tasks(config: &AppConfig, files: Vec<PathBuf>) -> Result<(usize, u
     Ok((imported_count, skipped_count))
 }
 
-fn read_required_env(key: &str) -> Result<String> {
-    env::var(key).with_context(|| format!("Missing environment variable: {key}. Please check .env"))
+fn read_optional_env(key: &str) -> Result<Option<String>> {
+    match env::var(key) {
+        Ok(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("Failed to read environment variable: {key}")),
+    }
 }
 
 fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
@@ -327,7 +342,7 @@ fn reset_database_objects(conn: &mut PooledConn, database_name: &str) -> Result<
 }
 
 fn connect_to_database(config: &AppConfig, database_name: &str) -> Result<PooledConn> {
-    let dsn = build_database_dsn(&config.mysql_dsn, database_name)?;
+    let dsn = build_database_dsn(&config.import_mysql_dsn, database_name)?;
     let opts = Opts::from_url(&dsn)
         .with_context(|| format!("Invalid MYSQL_DSN format: {}", mask_dsn(&dsn)))?;
     let pool = Pool::new(opts)?;
@@ -701,7 +716,7 @@ INSERT INTO t VALUES (1);
     #[test]
     fn matches_ignored_database_case_insensitively() {
         let config = AppConfig {
-            mysql_dsn: "mysql://user:pass@127.0.0.1:3306".to_string(),
+            import_mysql_dsn: "mysql://user:pass@127.0.0.1:3306".to_string(),
             sql_dir: PathBuf::from("./sql"),
             charset: "utf8mb4".to_string(),
             disable_foreign_key_checks: true,

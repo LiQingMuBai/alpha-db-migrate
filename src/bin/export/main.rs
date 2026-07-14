@@ -12,11 +12,12 @@ use url::Url;
 
 #[derive(Clone, Debug)]
 struct ExportConfig {
-    mysql_dsn: String,
+    export_mysql_dsn: String,
     export_databases: Vec<String>,
     ignored_databases: HashSet<String>,
     export_sql_dir: PathBuf,
     charset: String,
+    mysqldump_bin: String,
 }
 
 #[derive(Debug)]
@@ -82,7 +83,11 @@ impl ExportConfig {
         let export_databases = parse_database_list_required("EXPORT_DATABASES")?;
 
         Ok(Self {
-            mysql_dsn: read_required_env("MYSQL_DSN")?,
+            export_mysql_dsn: read_optional_env("EXPORT_MYSQL_DSN")?
+                .or_else(|| read_optional_env("MYSQL_DSN").ok().flatten())
+                .with_context(|| {
+                    "Missing environment variable: EXPORT_MYSQL_DSN (or MYSQL_DSN fallback). Please check .env"
+                })?,
             export_databases,
             ignored_databases: env::var("IGNORE_DATABASES")
                 .map(|value| parse_database_set(&value))
@@ -91,6 +96,7 @@ impl ExportConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./export_sql")),
             charset: env::var("MYSQL_CHARSET").unwrap_or_else(|_| "utf8mb4".to_string()),
+            mysqldump_bin: resolve_mysqldump_bin()?,
         })
     }
 }
@@ -126,7 +132,7 @@ fn run_export_tasks(config: &ExportConfig) -> Result<(usize, usize)> {
 }
 
 fn export_one_database(config: &ExportConfig, database_name: &str) -> Result<()> {
-    let connection = parse_mysql_dsn(&config.mysql_dsn)?;
+    let connection = parse_mysql_dsn(&config.export_mysql_dsn)?;
     let output_path = config.export_sql_dir.join(format!("{database_name}.sql"));
     let output_file = File::create(&output_path)
         .with_context(|| format!("Failed to create export file {}", output_path.display()))?;
@@ -137,7 +143,7 @@ fn export_one_database(config: &ExportConfig, database_name: &str) -> Result<()>
     );
 
     let started_at = Instant::now();
-    let mut command = Command::new("mysqldump");
+    let mut command = Command::new(&config.mysqldump_bin);
     command
         .arg(format!("--host={}", connection.host))
         .arg(format!("--port={}", connection.port))
@@ -180,18 +186,58 @@ fn export_one_database(config: &ExportConfig, database_name: &str) -> Result<()>
 }
 
 fn ensure_mysqldump_available() -> Result<()> {
-    let output = Command::new("mysqldump")
+    let dump_bin = resolve_mysqldump_bin()?;
+    let output = Command::new(&dump_bin)
         .arg("--version")
         .output()
-        .context(
-            "Failed to launch mysqldump. Please ensure it is installed and available in PATH",
-        )?;
+        .with_context(|| format!("Failed to launch dump tool: {}", dump_bin))?;
 
     if !output.status.success() {
-        bail!("mysqldump is installed but unavailable for execution");
+        bail!(
+            "Dump tool is installed but unavailable for execution: {}",
+            dump_bin
+        );
     }
 
     Ok(())
+}
+
+fn resolve_mysqldump_bin() -> Result<String> {
+    if let Ok(configured) = env::var("MYSQLDUMP_BIN") {
+        let trimmed = configured.trim();
+        if trimmed.is_empty() {
+            bail!("Environment variable MYSQLDUMP_BIN is empty");
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    for candidate in dump_command_candidates() {
+        if Command::new(candidate)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    bail!(
+        "Failed to find a dump tool. Set MYSQLDUMP_BIN in .env, for example /opt/homebrew/opt/mysql-client/bin/mysqldump"
+    )
+}
+
+fn dump_command_candidates() -> &'static [&'static str] {
+    &[
+        "mysqldump",
+        "mariadb-dump",
+        "/opt/homebrew/bin/mysqldump",
+        "/opt/homebrew/bin/mariadb-dump",
+        "/opt/homebrew/opt/mysql-client/bin/mysqldump",
+        "/usr/local/bin/mysqldump",
+        "/usr/local/mysql/bin/mysqldump",
+    ]
 }
 
 fn parse_mysql_dsn(dsn: &str) -> Result<MysqlConnectionConfig> {
@@ -217,6 +263,21 @@ fn parse_mysql_dsn(dsn: &str) -> Result<MysqlConnectionConfig> {
 
 fn read_required_env(key: &str) -> Result<String> {
     env::var(key).with_context(|| format!("Missing environment variable: {key}. Please check .env"))
+}
+
+fn read_optional_env(key: &str) -> Result<Option<String>> {
+    match env::var(key) {
+        Ok(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("Failed to read environment variable: {key}")),
+    }
 }
 
 fn parse_database_list_required(key: &str) -> Result<Vec<String>> {
@@ -303,8 +364,8 @@ fn mask_dsn(dsn: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_database_list, parse_database_set, parse_mysql_dsn, should_ignore_database,
-        skip_reason_for_dump_stderr,
+        dump_command_candidates, parse_database_list, parse_database_set, parse_mysql_dsn,
+        should_ignore_database, skip_reason_for_dump_stderr,
     };
 
     #[test]
@@ -344,5 +405,12 @@ mod tests {
             skip_reason_for_dump_stderr("mysqldump: Got error: 1142: command denied"),
             Some("insufficient privileges to run the export")
         );
+    }
+
+    #[test]
+    fn includes_common_dump_command_candidates() {
+        let candidates = dump_command_candidates();
+        assert!(candidates.contains(&"mysqldump"));
+        assert!(candidates.contains(&"/opt/homebrew/opt/mysql-client/bin/mysqldump"));
     }
 }
