@@ -1,4 +1,5 @@
 /target
+/export_sql
 .env
 .env.*
 !.env.example
